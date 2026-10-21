@@ -565,8 +565,6 @@ UA_AccessControl_default(UA_ServerConfig *config,
                          const UA_String *userTokenPolicyUri,
                          size_t usernamePasswordLoginSize,
                          const UA_UsernamePasswordLogin *usernamePasswordLogin) {
-    UA_LOG_WARNING(config->logging, UA_LOGCATEGORY_SERVER,
-                   "AccessControl: Unconfigured AccessControl. Users have all permissions.");
     UA_AccessControl *ac = &config->accessControl;
 
     if(ac->clear)

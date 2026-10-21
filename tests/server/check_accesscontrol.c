@@ -22,6 +22,10 @@
 #include "test_helpers.h"
 #include "thread_wrapper.h"
 
+#ifdef UA_ENABLE_ENCRYPTION
+#include "../encryption/certificates.h"
+#endif
+
 static UA_Server *server;
 static UA_atomic(uintptr_t) running;
 static THREAD_HANDLE server_thread;
@@ -529,6 +533,100 @@ START_TEST(Server_nullMandatoryCallback) {
     UA_Server_delete(server);
 } END_TEST
 
+typedef struct {
+    size_t unconfiguredWarnings;
+    size_t credentialWarnings;
+} AccessControlLogCapture;
+
+static void
+captureAccessControlLog(void *context, UA_LogLevel level, UA_LogCategory category,
+                        const char *msg, va_list args) {
+    (void)args;
+    AccessControlLogCapture *capture = (AccessControlLogCapture*)context;
+    if(level != UA_LOGLEVEL_WARNING || category != UA_LOGCATEGORY_SERVER)
+        return;
+    if(strstr(msg, "Unconfigured AccessControl"))
+        capture->unconfiguredWarnings++;
+    if(strstr(msg, "Username/Password Authentication configured") &&
+       strstr(msg, "This can leak credentials on the network"))
+        capture->credentialWarnings++;
+}
+
+/* Keep the logger alive from configuration through server deletion. A custom
+ * authorization callback can coexist with the default authentication callback. */
+START_TEST(Server_accessControlLogging) {
+    AccessControlLogCapture capture = {0, 0};
+    UA_Logger logger = {captureAccessControlLog, &capture, NULL};
+    UA_ServerConfig config;
+    memset(&config, 0, sizeof(config));
+    config.logging = &logger;
+    ck_assert_uint_eq(UA_ServerConfig_setMinimal(&config, 4840, NULL),
+                      UA_STATUSCODE_GOOD);
+
+    if(_i == 1) {
+        config.accessControl.allowBrowseNode = denyTestNodeBrowse;
+    } else if(_i == 2) {
+        /* Reconfiguration clears the previous plugin, including its credentials
+         * and token policies. It must not enable anonymous login. */
+        for(size_t i = 0; i < 3; i++) {
+            ck_assert_uint_eq(UA_AccessControl_default(&config, false, NULL,
+                                                      usernamePasswordsSize,
+                                                      usernamePasswords),
+                              UA_STATUSCODE_GOOD);
+        }
+    }
+    size_t configurationWarnings = capture.unconfiguredWarnings;
+
+    UA_Server *s = UA_Server_newWithConfig(&config);
+    ck_assert_ptr_ne(s, NULL);
+    ck_assert_uint_eq(UA_Server_run_startup(s), UA_STATUSCODE_GOOD);
+    UA_AccessControl *ac = &UA_Server_getConfig(s)->accessControl;
+    UA_ExtensionObject token;
+    UA_ExtensionObject_init(&token);
+    void *sessionContext = NULL;
+    ck_assert_uint_eq(ac->activateSession(s, ac, NULL, NULL, &UA_NODEID_NULL,
+                                          &token, &sessionContext),
+                      _i == 2 ? UA_STATUSCODE_BADIDENTITYTOKENINVALID :
+                      UA_STATUSCODE_GOOD);
+    if(_i == 1) {
+        const UA_NodeId denied = UA_NODEID_NUMERIC(1, 5001);
+        ck_assert(!ac->allowBrowseNode(s, ac, &UA_NODEID_NULL, NULL, &denied, NULL));
+    }
+
+    ck_assert_uint_eq(UA_Server_run_shutdown(s), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(UA_Server_delete(s), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(configurationWarnings, 0);
+    ck_assert_uint_eq(capture.unconfiguredWarnings, 0);
+#if UA_LOGLEVEL <= 400
+    if(_i == 2)
+        ck_assert_uint_eq(capture.credentialWarnings, 3);
+#endif
+} END_TEST
+
+#ifdef UA_ENABLE_ENCRYPTION
+START_TEST(Server_accessControlLoggingWithSecurityPolicies) {
+    AccessControlLogCapture capture = {0, 0};
+    UA_Logger logger = {captureAccessControlLog, &capture, NULL};
+    UA_ServerConfig config;
+    memset(&config, 0, sizeof(config));
+    config.logging = &logger;
+    UA_ByteString certificate = {CERT_DER_LENGTH, CERT_DER_DATA};
+    UA_ByteString privateKey = {KEY_DER_LENGTH, KEY_DER_DATA};
+    ck_assert_uint_eq(UA_ServerConfig_setDefaultWithSecurityPolicies(
+                          &config, 4840, &certificate, &privateKey,
+                          NULL, 0, NULL, 0, NULL, 0), UA_STATUSCODE_GOOD);
+    ck_assert(config.securityPoliciesSize > 1);
+    size_t configurationWarnings = capture.unconfiguredWarnings;
+    UA_Server *s = UA_Server_newWithConfig(&config);
+    ck_assert_ptr_ne(s, NULL);
+    ck_assert_uint_eq(UA_Server_run_startup(s), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(UA_Server_run_shutdown(s), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(UA_Server_delete(s), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(configurationWarnings, 0);
+    ck_assert_uint_eq(capture.unconfiguredWarnings, 0);
+} END_TEST
+#endif
+
 static Suite* testSuite_Client(void) {
     Suite *s = suite_create("Client");
     TCase *tc_client_user = tcase_create("Client User/Password");
@@ -550,6 +648,10 @@ static Suite* testSuite_Client(void) {
     tcase_add_test(tc_server, Client_commonAttributes_requireBrowse);
     tcase_add_test(tc_server, Client_write_notWritableVsUserAccessDenied);
     tcase_add_loop_test(tc_server, Server_nullMandatoryCallback, 0, 6);
+    tcase_add_loop_test(tc_server, Server_accessControlLogging, 0, 3);
+#ifdef UA_ENABLE_ENCRYPTION
+    tcase_add_test(tc_server, Server_accessControlLoggingWithSecurityPolicies);
+#endif
     suite_add_tcase(s,tc_server);
     return s;
 }

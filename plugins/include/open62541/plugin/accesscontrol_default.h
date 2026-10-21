@@ -26,6 +26,10 @@ typedef UA_StatusCode (*UA_UsernamePasswordLoginCallback)
 /* Default access control. The login can be anonymous, username-password or
  * certificate-based. A logged-in user has all access rights.
  *
+ * For production use, replace or customize this plugin to enforce appropriate
+ * access restrictions. Authentication and encryption alone do not restrict
+ * user permissions.
+ *
  * The plugin stores the UserIdentityToken in the session context. So that
  * cannot be used for other purposes.
  *
